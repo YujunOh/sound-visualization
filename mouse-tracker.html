@@ -1,0 +1,401 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>Function Viewer</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body { height:100%; overflow:hidden; }
+  body { display:grid; grid-template-columns:1fr 1fr; grid-template-rows:1fr 1fr; }
+  canvas { width:100%; height:100%; display:block; cursor:crosshair; }
+  #info {
+    position:fixed; top:8px; left:50%; transform:translateX(-50%);
+    background:rgba(0,0,0,.82); color:#fff; padding:8px 18px;
+    border-radius:8px; font:13px/1.6 monospace; pointer-events:none;
+    z-index:10; white-space:nowrap;
+  }
+  #help {
+    position:fixed; bottom:8px; left:50%; transform:translateX(-50%);
+    background:rgba(0,0,0,.5); color:#ccc; padding:4px 12px;
+    border-radius:6px; font:11px/1.4 sans-serif; pointer-events:none; z-index:10;
+  }
+</style>
+</head>
+<body>
+<canvas id="c0"></canvas><canvas id="c1"></canvas>
+<canvas id="c2"></canvas><canvas id="c3"></canvas>
+<div id="info"></div>
+<div id="help">Wheel: 전체 줌 · Shift+Wheel: X축만 · Ctrl+Wheel: Y축만 · 드래그: 이동 (동기화)</div>
+
+<script>
+// ---- CONFIG ----
+const LABELS  = ['y = sin(x)', 'y = cos(x)', 'y = tan(x)', 'Heatmap'];
+const COLORS  = ['#3388ff', '#22aa44', '#ff8833', '#dd3366'];
+const BG_ACT  = ['#eef3ff','#eefff3','#fff6ee','#fff0f4'];
+const FUNCS   = [Math.sin, Math.cos, Math.tan];
+
+// ---- STATE ----
+const canvases = [0,1,2,3].map(i => document.getElementById('c'+i));
+const ctxs     = canvases.map(c => c.getContext('2d'));
+const infoEl   = document.getElementById('info');
+const dpr      = devicePixelRatio || 1;
+
+// per-box independent zoom
+const S = Array.from({length:4}, () => ({x:50, y:50}));
+
+// shared pan (world coord at center)
+let panX = 0, panY = 0;
+
+// cursor world position
+let activeBox = 0, worldCX = 0, worldCY = 0;
+
+// drag
+let dragging = false, dSX, dSY, dPX, dPY;
+
+// ---- HEATMAP DATA (41×41, world range -20…+20) ----
+const HN = 41, HMIN = -20;
+const hm = Array.from({length:HN}, () =>
+  Array.from({length:HN}, () => Math.random()));
+
+function hmVal(wx, wy) {
+  const ix = Math.round(wx) - HMIN, iy = Math.round(wy) - HMIN;
+  return (ix>=0 && ix<HN && iy>=0 && iy<HN) ? hm[iy][ix] : null;
+}
+function hmClr(v) {
+  const t = Math.max(0, Math.min(1, v));
+  const h = (1-t)*240;                       // blue(0) → red(1)
+  return `hsl(${h},80%,50%)`;
+}
+
+// ---- HELPERS ----
+function niceStep(ppu) {
+  const raw = 80*dpr / ppu;
+  if (raw <= 0) return 1;
+  const m = 10 ** Math.floor(Math.log10(raw));
+  const r = raw / m;
+  return (r<=1.5?1 : r<=3.5?2 : r<=7.5?5 : 10) * m;
+}
+function fmt(v) { return Math.abs(v)<1e-9 ? '0' : String(+v.toPrecision(6)); }
+function clamp(v) { return Math.max(2, Math.min(5000, v)); }
+
+function toWorld(lx, ly, idx) {
+  const c = canvases[idx], s = S[idx];
+  return {
+    x: panX + (lx - c.clientWidth/2) / s.x,
+    y: panY + (c.clientHeight/2 - ly) / s.y
+  };
+}
+
+// ---- RESIZE / rAF ----
+function resize() {
+  canvases.forEach(c => { c.width = c.clientWidth*dpr; c.height = c.clientHeight*dpr; });
+  scheduleRedraw();
+}
+addEventListener('resize', resize);
+
+let raf = null;
+function scheduleRedraw() {
+  if (!raf) raf = requestAnimationFrame(() => { raf = null; drawAll(); });
+}
+
+// ---- DRAWING ----
+function drawAll() { canvases.forEach((c,i) => draw(c, ctxs[i], i)); }
+
+function draw(cv, ctx, idx) {
+  const w = cv.width, h = cv.height;
+  const s = S[idx], sxd = s.x*dpr, syd = s.y*dpr;
+  const active = idx === activeBox;
+
+  // world-origin pixel position
+  const ox = w/2 - panX * sxd;
+  const oy = h/2 + panY * syd;
+
+  /* ── background ── */
+  ctx.fillStyle = active ? BG_ACT[idx] : '#fafafa';
+  ctx.fillRect(0,0,w,h);
+
+  /* ── heatmap (box 3, under grid) ── */
+  if (idx === 3) drawHeatmap(ctx, ox, oy, sxd, syd, w, h);
+
+  /* ── grid + axis labels ── */
+  drawGrid(ctx, ox, oy, sxd, syd, w, h);
+
+  /* ── function curve (boxes 0-2) ── */
+  if (idx < 3) drawCurve(ctx, ox, oy, sxd, syd, w, h, FUNCS[idx], COLORS[idx]);
+
+  /* ── synced crosshair (all boxes) ── */
+  drawCrosshair(ctx, ox, oy, sxd, syd, w, h, active);
+
+  /* ── value dot on curve ── */
+  if (idx < 3) drawValueDot(ctx, ox, oy, sxd, syd, FUNCS[idx], COLORS[idx], idx);
+
+  /* ── legend ── */
+  drawLegend(ctx, idx, w);
+
+  /* ── border ── */
+  ctx.strokeStyle = active ? COLORS[idx] : '#bbb';
+  ctx.lineWidth = (active ? 3 : 1) * dpr;
+  ctx.strokeRect(0,0,w,h);
+}
+
+/* ── Grid & axes ── */
+function drawGrid(ctx, ox, oy, sxd, syd, w, h) {
+  const stX = niceStep(sxd), stY = niceStep(syd);
+  const fs = Math.round(10*dpr);
+  ctx.font = `${fs}px monospace`;
+
+  // vertical lines
+  const xLo = -ox/sxd, xHi = (w-ox)/sxd;
+  for (let x = Math.ceil(xLo/stX)*stX; x <= xHi; x += stX) {
+    const px = ox + x*sxd;
+    const isAx = Math.abs(x) < 1e-9;
+    ctx.strokeStyle = isAx ? '#444' : '#ddd';
+    ctx.lineWidth   = isAx ? 1.5*dpr : 0.5;
+    ctx.beginPath(); ctx.moveTo(px,0); ctx.lineTo(px,h); ctx.stroke();
+    ctx.fillStyle = '#777'; ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+    ctx.fillText(fmt(x), px, oy + 3*dpr);
+  }
+
+  // horizontal lines
+  const yLo = -(h-oy)/syd, yHi = oy/syd;
+  for (let y = Math.ceil(yLo/stY)*stY; y <= yHi; y += stY) {
+    const py = oy - y*syd;
+    const isAx = Math.abs(y) < 1e-9;
+    ctx.strokeStyle = isAx ? '#444' : '#ddd';
+    ctx.lineWidth   = isAx ? 1.5*dpr : 0.5;
+    ctx.beginPath(); ctx.moveTo(0,py); ctx.lineTo(w,py); ctx.stroke();
+    if (Math.abs(y) > 1e-9) {
+      ctx.fillStyle = '#777'; ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+      ctx.fillText(fmt(y), ox - 3*dpr, py);
+    }
+  }
+
+  // bold axes
+  ctx.strokeStyle = '#333'; ctx.lineWidth = 1.5*dpr;
+  ctx.beginPath();
+  ctx.moveTo(0,oy); ctx.lineTo(w,oy);
+  ctx.moveTo(ox,0); ctx.lineTo(ox,h);
+  ctx.stroke();
+
+  // axis arrow labels
+  ctx.fillStyle = '#333';
+  ctx.font = `bold ${Math.round(12*dpr)}px sans-serif`;
+  ctx.textAlign = 'left'; ctx.textBaseline = 'bottom';
+  ctx.fillText('X', w - 16*dpr, oy - 5*dpr);
+  ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+  ctx.fillText('Y', ox + 5*dpr, 5*dpr);
+}
+
+/* ── Function curve ── */
+function drawCurve(ctx, ox, oy, sxd, syd, w, h, fn, color) {
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2.5 * dpr;
+  ctx.beginPath();
+  let on = false, prevPy = 0;
+  for (let px = 0; px < w; px++) {
+    const wx = (px - ox) / sxd;
+    const fy = fn(wx);
+    const py = oy - fy * syd;
+    if (!isFinite(fy) || (on && Math.abs(py - prevPy) > h * 0.5)) { on = false; continue; }
+    on ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+    on = true; prevPy = py;
+  }
+  ctx.stroke();
+}
+
+/* ── Heatmap cells ── */
+function drawHeatmap(ctx, ox, oy, sxd, syd, w, h) {
+  const cellW = Math.ceil(sxd) + 1;
+  const cellH = Math.ceil(syd) + 1;
+  for (let iy = 0; iy < HN; iy++) {
+    for (let ix = 0; ix < HN; ix++) {
+      const wx = HMIN + ix, wy = HMIN + iy;
+      const px = ox + (wx - 0.5) * sxd;
+      const py = oy - (wy + 0.5) * syd;
+      if (px + cellW < 0 || px > w || py + cellH < 0 || py > h) continue;
+      ctx.fillStyle = hmClr(hm[iy][ix]);
+      ctx.fillRect(px, py, cellW, cellH);
+    }
+  }
+}
+
+/* ── Crosshair (synced across all boxes) ── */
+function drawCrosshair(ctx, ox, oy, sxd, syd, w, h, active) {
+  const cpx = ox + worldCX * sxd;
+  const cpy = oy - worldCY * syd;
+
+  ctx.save();
+  ctx.strokeStyle = active ? 'rgba(255,30,30,0.55)' : 'rgba(130,130,130,0.22)';
+  ctx.lineWidth = (active ? 1.5 : 1) * dpr;
+  ctx.setLineDash([5*dpr, 4*dpr]);
+  ctx.beginPath();
+  ctx.moveTo(cpx, 0); ctx.lineTo(cpx, h);
+  ctx.moveTo(0, cpy); ctx.lineTo(w, cpy);
+  ctx.stroke();
+  ctx.restore();
+
+  if (active) {
+    ctx.fillStyle = 'red';
+    ctx.beginPath(); ctx.arc(cpx, cpy, 3.5*dpr, 0, Math.PI*2); ctx.fill();
+  }
+}
+
+/* ── Value dot on function curve at cursor x ── */
+function drawValueDot(ctx, ox, oy, sxd, syd, fn, color, idx) {
+  const fv = fn(worldCX);
+  if (!isFinite(fv) || Math.abs(fv) > 1e4) return;
+
+  const vx = ox + worldCX * sxd;
+  const vy = oy - fv * syd;
+
+  // outer ring (white border)
+  ctx.strokeStyle = '#fff'; ctx.lineWidth = 3*dpr;
+  ctx.beginPath(); ctx.arc(vx, vy, 5*dpr, 0, Math.PI*2); ctx.stroke();
+  // filled dot
+  ctx.fillStyle = color;
+  ctx.beginPath(); ctx.arc(vx, vy, 5*dpr, 0, Math.PI*2); ctx.fill();
+
+  // value label
+  const label = fv.toFixed(4);
+  const fs = Math.round(11*dpr);
+  ctx.font = `bold ${fs}px monospace`;
+  ctx.fillStyle = 'rgba(255,255,255,0.85)';
+  const tw = ctx.measureText(label).width;
+  const pad = 4*dpr;
+  const lx = vx + 10*dpr, ly = vy - 10*dpr - fs;
+  ctx.fillRect(lx - pad, ly - pad, tw + pad*2, fs + pad*2);
+  ctx.strokeStyle = color; ctx.lineWidth = 1;
+  ctx.strokeRect(lx - pad, ly - pad, tw + pad*2, fs + pad*2);
+  ctx.fillStyle = '#333';
+  ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+  ctx.fillText(label, lx, ly);
+}
+
+/* ── Legend ── */
+function drawLegend(ctx, idx, canvasW) {
+  const p  = 10*dpr;
+  const lw = (idx === 3 ? 135 : 115) * dpr;
+  const lh = (idx === 3 ? 62 : 30) * dpr;
+  const lx = canvasW - lw - p, ly = p;
+
+  // background
+  ctx.fillStyle = 'rgba(255,255,255,0.9)';
+  ctx.fillRect(lx, ly, lw, lh);
+  ctx.strokeStyle = '#bbb'; ctx.lineWidth = 1;
+  ctx.strokeRect(lx, ly, lw, lh);
+
+  const fs = Math.round(11*dpr);
+  ctx.font = `bold ${fs}px sans-serif`;
+  ctx.textAlign = 'left'; ctx.textBaseline = 'middle';
+
+  if (idx < 3) {
+    const cy = ly + lh/2;
+    const ll = 22*dpr;
+    ctx.strokeStyle = COLORS[idx]; ctx.lineWidth = 3*dpr;
+    ctx.beginPath(); ctx.moveTo(lx+8*dpr, cy); ctx.lineTo(lx+8*dpr+ll, cy); ctx.stroke();
+    ctx.fillStyle = '#333';
+    ctx.fillText(LABELS[idx], lx + 8*dpr + ll + 6*dpr, cy);
+  } else {
+    ctx.fillStyle = '#333';
+    ctx.fillText('Heatmap', lx+8*dpr, ly+13*dpr);
+    // color bar
+    const bx = lx+8*dpr, by = ly+26*dpr, bw = lw-16*dpr, bh = 10*dpr;
+    for (let i = 0; i < bw; i++) {
+      ctx.fillStyle = hmClr(i / bw);
+      ctx.fillRect(bx+i, by, 2, bh);
+    }
+    ctx.strokeStyle = '#999'; ctx.lineWidth = 1;
+    ctx.strokeRect(bx, by, bw, bh);
+    // 0 / 1 labels
+    const fs2 = Math.round(9*dpr);
+    ctx.font = `${fs2}px monospace`; ctx.fillStyle = '#555'; ctx.textBaseline = 'top';
+    ctx.textAlign = 'left';  ctx.fillText('0.0', bx, by+bh+2*dpr);
+    ctx.textAlign = 'right'; ctx.fillText('1.0', bx+bw, by+bh+2*dpr);
+  }
+}
+
+// ---- INFO BAR ----
+function updateInfo() {
+  const x = worldCX, y = worldCY;
+  const sv = Math.sin(x), cv = Math.cos(x), tv = Math.tan(x);
+  const hvRaw = hmVal(x, y);
+
+  const f4 = v => v.toFixed(4);
+  const tvStr = Math.abs(tv) > 1e6 ? '∞' : f4(tv);
+  const hvStr = hvRaw !== null ? hvRaw.toFixed(3) : '—';
+
+  infoEl.innerHTML =
+    `x:<b>${x.toFixed(3)}</b> y:<b>${y.toFixed(3)}</b>` +
+    `&ensp;│&ensp;` +
+    `<span style="color:${COLORS[0]}">sin=${f4(sv)}</span>&ensp;` +
+    `<span style="color:${COLORS[1]}">cos=${f4(cv)}</span>&ensp;` +
+    `<span style="color:${COLORS[2]}">tan=${tvStr}</span>&ensp;` +
+    `<span style="color:${COLORS[3]}">hm=${hvStr}</span>`;
+}
+
+// ---- EVENTS ----
+function boxIdx(e) {
+  return (e.clientY < innerHeight/2 ? 0 : 2) + (e.clientX < innerWidth/2 ? 0 : 1);
+}
+function localXY(e, i) {
+  const r = canvases[i].getBoundingClientRect();
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+
+/* ── mouse move ── */
+addEventListener('mousemove', e => {
+  activeBox = boxIdx(e);
+  const loc = localXY(e, activeBox);
+
+  if (dragging) {
+    const s = S[activeBox];
+    panX = dPX - (e.clientX - dSX) / s.x;
+    panY = dPY + (e.clientY - dSY) / s.y;
+  }
+
+  const wc = toWorld(loc.x, loc.y, activeBox);
+  worldCX = wc.x; worldCY = wc.y;
+  updateInfo();
+  scheduleRedraw();
+});
+
+/* ── zoom (mouse-centered, per-box scale) ── */
+addEventListener('wheel', e => {
+  e.preventDefault();
+  const i = boxIdx(e);
+  const loc = localXY(e, i);
+  const c = canvases[i], s = S[i];
+  const cw = c.clientWidth, ch = c.clientHeight;
+
+  // world point under cursor before zoom
+  const {x: wx, y: wy} = toWorld(loc.x, loc.y, i);
+
+  const f = e.deltaY > 0 ? 0.9 : 1.1;
+  if      (e.shiftKey) { s.x = clamp(s.x * f); }
+  else if (e.ctrlKey)  { s.y = clamp(s.y * f); }
+  else                 { s.x = clamp(s.x * f); s.y = clamp(s.y * f); }
+
+  // adjust pan to keep same world point under cursor
+  panX = wx - (loc.x - cw/2) / s.x;
+  panY = wy - (ch/2 - loc.y) / s.y;
+
+  // recalculate cursor world
+  const wc = toWorld(loc.x, loc.y, activeBox);
+  worldCX = wc.x; worldCY = wc.y;
+  updateInfo();
+  scheduleRedraw();
+}, { passive: false });
+
+/* ── pan (drag) ── */
+addEventListener('mousedown', e => {
+  dragging = true;
+  dSX = e.clientX; dSY = e.clientY;
+  dPX = panX; dPY = panY;
+});
+addEventListener('mouseup', () => { dragging = false; });
+
+/* ── init ── */
+resize();
+</script>
+</body>
+</html>

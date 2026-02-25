@@ -1,0 +1,693 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>Audio Analyzer</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+html, body { height:100%; overflow:hidden; background:#0d1117; color:#c9d1d9; font-family:'Segoe UI',sans-serif; }
+
+/* ── Toolbar ── */
+#toolbar {
+  height:52px; display:flex; align-items:center; gap:10px; padding:0 14px;
+  background:#161b22; border-bottom:1px solid #30363d;
+}
+#toolbar button {
+  background:#21262d; color:#c9d1d9; border:1px solid #30363d; border-radius:6px;
+  padding:5px 16px; font-size:13px; cursor:pointer; transition:all .15s;
+}
+#toolbar button:hover:not(:disabled) { background:#30363d; border-color:#58a6ff; }
+#toolbar button:disabled { opacity:.35; cursor:default; }
+#toolbar button.playing { background:#1f6feb; border-color:#58a6ff; color:#fff; }
+
+#fileLabel {
+  background:#21262d; border:1px dashed #484f58; border-radius:6px;
+  padding:5px 14px; cursor:pointer; font-size:12px; color:#8b949e;
+  transition:all .15s; white-space:nowrap;
+}
+#fileLabel:hover { background:#30363d; border-color:#58a6ff; color:#c9d1d9; }
+#fileInput { display:none; }
+#fileName { font-size:12px; color:#58a6ff; max-width:160px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+
+#timeDisplay { font:13px/1 Consolas,monospace; color:#79c0ff; min-width:200px; text-align:center; }
+
+#seekbar { flex:1; min-width:60px; max-width:260px; accent-color:#58a6ff; height:4px; cursor:pointer; }
+#volWrap { display:flex; align-items:center; gap:4px; margin-left:auto; }
+#volWrap span { font-size:11px; color:#484f58; }
+#volume { width:70px; accent-color:#58a6ff; }
+
+/* ── Panels ── */
+#panels {
+  height:calc(100% - 52px - 28px);
+  display:grid; grid-template-columns:1fr 1fr; grid-template-rows:1fr 1fr;
+  gap:1px; background:#010409;
+}
+canvas { width:100%; height:100%; display:block; }
+
+/* ── Info bar ── */
+#info {
+  height:28px; display:flex; align-items:center; justify-content:center;
+  background:#161b22; border-top:1px solid #30363d;
+  font:11px/1 Consolas,monospace; color:#8b949e; gap:6px;
+}
+#info span { white-space:nowrap; }
+.hl { color:#c9d1d9; font-weight:bold; }
+</style>
+</head>
+<body>
+
+<div id="toolbar">
+  <label id="fileLabel">📂 파일 열기
+    <input type="file" id="fileInput" accept=".wav,.mp3,.ogg,.flac,.aac,.m4a">
+  </label>
+  <span id="fileName"></span>
+  <button id="btnPlay" disabled>▶ Play</button>
+  <button id="btnStop" disabled>⏹ Stop</button>
+  <span id="timeDisplay">--:--.--- / --:--.---</span>
+  <input type="range" id="seekbar" min="0" max="1" step="0.0001" value="0" disabled>
+  <div id="volWrap"><span>Vol</span><input type="range" id="volume" min="0" max="1" step="0.01" value="0.8"></div>
+</div>
+
+<div id="panels">
+  <canvas id="c0"></canvas><canvas id="c1"></canvas>
+  <canvas id="c2"></canvas><canvas id="c3"></canvas>
+</div>
+<div id="info"><span>오디오 파일을 로드하세요</span></div>
+
+<script>
+/* ================================================================
+   CONSTANTS & CONFIG
+   ================================================================ */
+const dpr = devicePixelRatio || 1;
+const FFT_SIZE    = 8192;
+const NUM_BANDS   = 64;       // log-frequency bands
+const NUM_MEL     = 40;       // mel bands
+const OCTAVE_FC   = [31.5, 63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000];
+const OCTAVE_LBL  = ['31.5','63','125','250','500','1k','2k','4k','8k','16k'];
+const DB_MIN = -100, DB_MAX = 0;
+const PEAK_DECAY  = 0.4;      // dB per frame
+
+const PANEL_TITLES = ['Waveform & LEQ', 'Band Spectrum', 'Mel Spectrum', '1/1 Octave Band'];
+const PANEL_COLORS = ['#58a6ff','#3fb950','#bc8cff','#f0883e'];
+
+/* ================================================================
+   DOM REFS
+   ================================================================ */
+const canvases  = [0,1,2,3].map(i => document.getElementById('c'+i));
+const ctxs      = canvases.map(c => c.getContext('2d'));
+const infoEl    = document.getElementById('info');
+const btnPlay   = document.getElementById('btnPlay');
+const btnStop   = document.getElementById('btnStop');
+const timeDisp  = document.getElementById('timeDisplay');
+const seekbar   = document.getElementById('seekbar');
+const volSlider = document.getElementById('volume');
+const fileInput = document.getElementById('fileInput');
+const fileNameEl= document.getElementById('fileName');
+
+/* ================================================================
+   AUDIO STATE
+   ================================================================ */
+let audioCtx = null, analyser = null, gainNode = null, sourceNode = null;
+let audioBuffer = null;
+let isPlaying = false, playOffset = 0, playCtxTime = 0;
+
+// Pre-computed waveform
+let waveformPeaks = [];
+
+// Analysis data
+let freqData, timeData;
+let curLeq = -120;
+let curBands   = new Float32Array(NUM_BANDS).fill(-120);
+let curMel     = new Float32Array(NUM_MEL).fill(-120);
+let curOctave  = new Float32Array(OCTAVE_FC.length).fill(-120);
+let peakBands  = new Float32Array(NUM_BANDS).fill(-120);
+let peakMel    = new Float32Array(NUM_MEL).fill(-120);
+let peakOctave = new Float32Array(OCTAVE_FC.length).fill(-120);
+
+// Filter banks (built after file load)
+let specBands = null, melFilters = null;
+
+// Hover
+let hoverPanel = -1, hoverNX = 0, hoverNY = 0;
+let seeking = false;
+
+/* ================================================================
+   AUDIO ENGINE
+   ================================================================ */
+function initAudio() {
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+  analyser = audioCtx.createAnalyser();
+  analyser.fftSize = FFT_SIZE;
+  analyser.smoothingTimeConstant = 0.82;
+  gainNode = audioCtx.createGain();
+  gainNode.gain.value = +volSlider.value;
+  analyser.connect(gainNode);
+  gainNode.connect(audioCtx.destination);
+  freqData = new Float32Array(analyser.frequencyBinCount);
+  timeData = new Float32Array(FFT_SIZE);
+}
+
+function now() {
+  if (!audioBuffer) return 0;
+  if (!isPlaying) return playOffset;
+  return Math.min(playOffset + (audioCtx.currentTime - playCtxTime), audioBuffer.duration);
+}
+function fmtTime(s) {
+  if (!isFinite(s)) return '--:--.---';
+  const m = Math.floor(s / 60), sec = Math.floor(s % 60), ms = Math.floor((s % 1) * 1000);
+  return `${m}:${String(sec).padStart(2,'0')}.${String(ms).padStart(3,'0')}`;
+}
+
+async function loadFile(file) {
+  if (!audioCtx) initAudio();
+  if (audioCtx.state === 'suspended') await audioCtx.resume();
+  if (isPlaying) doStop();
+
+  try {
+    audioBuffer = await audioCtx.decodeAudioData(await file.arrayBuffer());
+  } catch { alert('오디오 파일을 디코딩할 수 없습니다.'); return; }
+
+  playOffset = 0;
+  fileNameEl.textContent = file.name;
+  btnPlay.disabled = false; btnStop.disabled = false; seekbar.disabled = false;
+
+  computeWaveform();
+  buildSpecBands();
+  buildMelFilters();
+  resetAnalysis();
+  drawAll();
+  updateTime();
+}
+
+function doPlay() {
+  if (!audioBuffer || isPlaying) return;
+  if (audioCtx.state === 'suspended') audioCtx.resume();
+  if (playOffset >= audioBuffer.duration) playOffset = 0;
+
+  sourceNode = audioCtx.createBufferSource();
+  sourceNode.buffer = audioBuffer;
+  sourceNode.connect(analyser);
+  playCtxTime = audioCtx.currentTime;
+  sourceNode.start(0, playOffset);
+  isPlaying = true;
+  sourceNode.onended = () => {
+    if (isPlaying) { isPlaying = false; playOffset = 0; updateBtns(); drawAll(); updateTime(); }
+  };
+  updateBtns();
+  tickLoop();
+}
+function doPause() {
+  if (!isPlaying) return;
+  playOffset = now();
+  sourceNode.stop(); sourceNode.disconnect(); sourceNode = null;
+  isPlaying = false;
+  updateBtns();
+}
+function doStop() {
+  if (isPlaying) { sourceNode.stop(); sourceNode.disconnect(); sourceNode = null; isPlaying = false; }
+  playOffset = 0;
+  resetAnalysis();
+  updateBtns(); drawAll(); updateTime();
+}
+function seekTo(t) {
+  const was = isPlaying;
+  if (was) { sourceNode.stop(); sourceNode.disconnect(); sourceNode = null; isPlaying = false; }
+  playOffset = Math.max(0, Math.min(t, audioBuffer ? audioBuffer.duration : 0));
+  if (was) doPlay(); else { drawAll(); updateTime(); }
+}
+function updateBtns() {
+  btnPlay.textContent = isPlaying ? '⏸ Pause' : '▶ Play';
+  btnPlay.classList.toggle('playing', isPlaying);
+}
+function updateTime() {
+  const t = now(), d = audioBuffer ? audioBuffer.duration : 0;
+  timeDisp.textContent = `${fmtTime(t)} / ${fmtTime(d)}`;
+  if (!seeking) seekbar.value = d > 0 ? t / d : 0;
+}
+
+/* ================================================================
+   WAVEFORM PRE-COMPUTE
+   ================================================================ */
+function computeWaveform() {
+  if (!audioBuffer) return;
+  const ch = audioBuffer.getChannelData(0);
+  const N = 4000;
+  const step = Math.floor(ch.length / N);
+  waveformPeaks = [];
+  for (let i = 0; i < N; i++) {
+    let mn = 1, mx = -1;
+    const s = i * step, e = Math.min(s + step, ch.length);
+    for (let j = s; j < e; j++) { if (ch[j] < mn) mn = ch[j]; if (ch[j] > mx) mx = ch[j]; }
+    waveformPeaks.push({ mn, mx });
+  }
+}
+
+/* ================================================================
+   FILTER BANKS
+   ================================================================ */
+function buildSpecBands() {
+  if (!audioBuffer) return;
+  const sr = audioBuffer.sampleRate, binW = sr / FFT_SIZE, nBins = FFT_SIZE / 2;
+  const logMin = Math.log10(20), logMax = Math.log10(sr / 2);
+  specBands = [];
+  for (let i = 0; i < NUM_BANDS; i++) {
+    const fLo = 10 ** (logMin + i * (logMax - logMin) / NUM_BANDS);
+    const fHi = 10 ** (logMin + (i + 1) * (logMax - logMin) / NUM_BANDS);
+    specBands.push({
+      lo: Math.max(0, Math.floor(fLo / binW)),
+      hi: Math.min(nBins - 1, Math.ceil(fHi / binW)),
+      hz: Math.sqrt(fLo * fHi)
+    });
+  }
+}
+function buildMelFilters() {
+  if (!audioBuffer) return;
+  const sr = audioBuffer.sampleRate;
+  const hzToMel = hz => 2595 * Math.log10(1 + hz / 700);
+  const melToHz = m => 700 * (10 ** (m / 2595) - 1);
+  const maxMel = hzToMel(sr / 2);
+  const edges = [];
+  for (let i = 0; i <= NUM_MEL + 1; i++) edges.push(Math.round(melToHz(i * maxMel / (NUM_MEL + 1)) * FFT_SIZE / sr));
+  melFilters = [];
+  for (let i = 0; i < NUM_MEL; i++) melFilters.push({ lo: edges[i], c: edges[i+1], hi: edges[i+2] });
+}
+
+/* ================================================================
+   ANALYSIS COMPUTE
+   ================================================================ */
+function computeAll() {
+  analyser.getFloatFrequencyData(freqData);
+  analyser.getFloatTimeDomainData(timeData);
+
+  // LEQ (RMS → dBFS)
+  let sum = 0;
+  for (let i = 0; i < timeData.length; i++) sum += timeData[i] ** 2;
+  curLeq = 20 * Math.log10(Math.sqrt(sum / timeData.length) + 1e-12);
+
+  // Band spectrum
+  if (specBands) {
+    for (let i = 0; i < NUM_BANDS; i++) {
+      let s = 0;
+      for (let b = specBands[i].lo; b <= specBands[i].hi && b < freqData.length; b++)
+        s += 10 ** (freqData[b] / 10);
+      curBands[i] = s > 0 ? 10 * Math.log10(s) : -120;
+    }
+  }
+  // Mel spectrum
+  if (melFilters) {
+    for (let i = 0; i < NUM_MEL; i++) {
+      const { lo, c, hi } = melFilters[i];
+      let s = 0;
+      for (let b = lo; b < hi && b < freqData.length; b++) {
+        const w = b < c ? (b - lo) / (c - lo + .001) : (hi - b) / (hi - c + .001);
+        s += 10 ** (freqData[b] / 10) * Math.max(0, w);
+      }
+      curMel[i] = s > 0 ? 10 * Math.log10(s) : -120;
+    }
+  }
+  // Octave
+  if (audioBuffer) {
+    const binW = audioBuffer.sampleRate / FFT_SIZE;
+    for (let i = 0; i < OCTAVE_FC.length; i++) {
+      const fLo = OCTAVE_FC[i] / Math.SQRT2, fHi = OCTAVE_FC[i] * Math.SQRT2;
+      const bLo = Math.max(0, Math.floor(fLo / binW)), bHi = Math.min(freqData.length - 1, Math.ceil(fHi / binW));
+      let s = 0;
+      for (let b = bLo; b <= bHi; b++) s += 10 ** (freqData[b] / 10);
+      curOctave[i] = s > 0 ? 10 * Math.log10(s) : -120;
+    }
+  }
+  // Peaks
+  updPk(curBands, peakBands);
+  updPk(curMel, peakMel);
+  updPk(curOctave, peakOctave);
+}
+function updPk(cur, pk) {
+  for (let i = 0; i < cur.length; i++) {
+    if (cur[i] > pk[i]) pk[i] = cur[i]; else pk[i] = Math.max(cur[i], pk[i] - PEAK_DECAY);
+  }
+}
+function resetAnalysis() {
+  curLeq = -120;
+  curBands.fill(-120); curMel.fill(-120); curOctave.fill(-120);
+  peakBands.fill(-120); peakMel.fill(-120); peakOctave.fill(-120);
+}
+
+/* ================================================================
+   TICK LOOP
+   ================================================================ */
+let ticking = false;
+function tickLoop() {
+  if (ticking) return; ticking = true;
+  (function tick() {
+    if (!isPlaying) { ticking = false; return; }
+    computeAll();
+    drawAll();
+    updateTime();
+    updateInfoBar();
+    requestAnimationFrame(tick);
+  })();
+}
+
+/* ================================================================
+   RESIZE
+   ================================================================ */
+function resize() {
+  canvases.forEach(c => { c.width = c.clientWidth * dpr; c.height = c.clientHeight * dpr; });
+  drawAll();
+}
+addEventListener('resize', resize);
+
+/* ================================================================
+   DRAWING
+   ================================================================ */
+function drawAll() { canvases.forEach((c, i) => drawPanel(c, ctxs[i], i)); }
+
+function drawPanel(cv, ctx, idx) {
+  const w = cv.width, h = cv.height;
+  const active = idx === hoverPanel;
+
+  ctx.fillStyle = '#0d1117';
+  ctx.fillRect(0, 0, w, h);
+
+  if (!audioBuffer && idx === 0) {
+    ctx.fillStyle = '#484f58'; ctx.font = `${14*dpr}px sans-serif`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+    ctx.fillText('📂 WAV / MP3 파일을 로드하세요', w/2, h/2);
+  }
+
+  switch (idx) {
+    case 0: drawWaveform(ctx, w, h); break;
+    case 1: drawBarChart(ctx, w, h, curBands, peakBands, NUM_BANDS, specBands, 1); break;
+    case 2: drawBarChart(ctx, w, h, curMel, peakMel, NUM_MEL, null, 2); break;
+    case 3: drawBarChart(ctx, w, h, curOctave, peakOctave, OCTAVE_FC.length, null, 3); break;
+  }
+
+  // Title
+  ctx.fillStyle = PANEL_COLORS[idx]; ctx.globalAlpha = 0.9;
+  ctx.font = `bold ${12*dpr}px sans-serif`; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+  ctx.fillText(PANEL_TITLES[idx], 10*dpr, 8*dpr);
+  ctx.globalAlpha = 1;
+
+  // Border
+  ctx.strokeStyle = active ? PANEL_COLORS[idx] : '#21262d';
+  ctx.lineWidth = active ? 2*dpr : 1;
+  ctx.strokeRect(0, 0, w, h);
+}
+
+/* ── Waveform + LEQ ── */
+function drawWaveform(ctx, w, h) {
+  if (waveformPeaks.length === 0) return;
+
+  const P = { t: 28*dpr, b: 22*dpr, l: 10*dpr, r: 10*dpr };
+  const pw = w - P.l - P.r, ph = h - P.t - P.b;
+  const midY = P.t + ph / 2;
+  const n = waveformPeaks.length;
+  const bw = pw / n;
+  const t = now(), dur = audioBuffer.duration;
+  const progress = dur > 0 ? t / dur : 0;
+
+  // Center line
+  ctx.strokeStyle = '#21262d'; ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(P.l, midY); ctx.lineTo(P.l + pw, midY); ctx.stroke();
+
+  // Waveform bars
+  for (let i = 0; i < n; i++) {
+    const x = P.l + i * bw;
+    const pos = i / n;
+    const played = pos <= progress;
+    const { mn, mx } = waveformPeaks[i];
+    const y1 = midY - mx * (ph / 2);
+    const y2 = midY - mn * (ph / 2);
+    ctx.fillStyle = played ? '#1f6feb' : '#21262d';
+    ctx.fillRect(x, y1, Math.max(1, bw), y2 - y1 || 1);
+  }
+
+  // Playhead
+  if (isPlaying || playOffset > 0) {
+    const px = P.l + progress * pw;
+    ctx.strokeStyle = '#f85149'; ctx.lineWidth = 2*dpr;
+    ctx.beginPath(); ctx.moveTo(px, P.t); ctx.lineTo(px, P.t + ph); ctx.stroke();
+    // Time at playhead
+    ctx.fillStyle = '#f85149'; ctx.font = `bold ${10*dpr}px Consolas,monospace`;
+    ctx.textAlign = 'center'; ctx.textBaseline = 'bottom';
+    ctx.fillText(fmtTime(t), px, P.t - 2*dpr);
+  }
+
+  // LEQ badge
+  const leqStr = curLeq > -100 ? curLeq.toFixed(1) + ' dBFS' : '— dBFS';
+  ctx.fillStyle = '#161b22'; ctx.globalAlpha = 0.85;
+  const badge = ctx.measureText('LEQ: ' + leqStr);
+  const bx = w - P.r - badge.width - 20*dpr, by = 6*dpr;
+  ctx.fillRect(bx - 6*dpr, by - 2*dpr, badge.width + 12*dpr, 16*dpr);
+  ctx.globalAlpha = 1;
+  ctx.fillStyle = '#79c0ff'; ctx.font = `bold ${11*dpr}px Consolas,monospace`;
+  ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+  ctx.fillText('LEQ: ' + leqStr, bx, by);
+
+  // Level bar (small horizontal bar under LEQ badge)
+  const lvlW = badge.width + 12*dpr;
+  const lvlH = 4*dpr;
+  const lvlX = bx - 6*dpr, lvlY = by + 18*dpr;
+  ctx.fillStyle = '#21262d'; ctx.fillRect(lvlX, lvlY, lvlW, lvlH);
+  const lvlFill = Math.max(0, (curLeq + 100) / 100);
+  const lvlColor = lvlFill > 0.85 ? '#f85149' : lvlFill > 0.6 ? '#d29922' : '#3fb950';
+  ctx.fillStyle = lvlColor; ctx.fillRect(lvlX, lvlY, lvlW * lvlFill, lvlH);
+
+  // Time axis labels
+  ctx.fillStyle = '#484f58'; ctx.font = `${9*dpr}px Consolas,monospace`;
+  ctx.textBaseline = 'top';
+  const ticks = [0, 0.25, 0.5, 0.75, 1];
+  for (const frac of ticks) {
+    const x = P.l + frac * pw;
+    ctx.textAlign = frac < 0.1 ? 'left' : frac > 0.9 ? 'right' : 'center';
+    ctx.fillText(fmtTime(frac * dur), x, P.t + ph + 4*dpr);
+  }
+
+  // Legend
+  drawLegendItem(ctx, w - 100*dpr, P.t + ph - 16*dpr, '#1f6feb', 'Waveform');
+}
+
+/* ── Bar Chart (Spectrum / Mel / Octave) ── */
+function drawBarChart(ctx, w, h, data, peaks, n, bandInfo, panelIdx) {
+  const P = { t: 30*dpr, b: 28*dpr, l: 44*dpr, r: 10*dpr };
+  const pw = w - P.l - P.r, ph = h - P.t - P.b;
+  const bw = pw / n, gap = Math.max(1, bw * 0.12);
+
+  // dB grid
+  ctx.font = `${9*dpr}px Consolas,monospace`;
+  for (let db = -80; db <= 0; db += 20) {
+    const y = P.t + ph * (1 - (db - DB_MIN) / (DB_MAX - DB_MIN));
+    ctx.strokeStyle = '#ffffff08'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(P.l, y); ctx.lineTo(P.l + pw, y); ctx.stroke();
+    ctx.fillStyle = '#484f58'; ctx.textAlign = 'right'; ctx.textBaseline = 'middle';
+    ctx.fillText(`${db}`, P.l - 4*dpr, y);
+  }
+
+  // Hover index
+  const hIdx = (hoverPanel === panelIdx) ? Math.floor(hoverNX * n) : -1;
+
+  // Bars
+  for (let i = 0; i < n; i++) {
+    const db = Math.max(DB_MIN, Math.min(DB_MAX, data[i]));
+    const norm = (db - DB_MIN) / (DB_MAX - DB_MIN);
+    const barH = norm * ph;
+    const x = P.l + i * bw + gap / 2;
+    const y = P.t + ph - barH;
+    const bww = bw - gap;
+
+    // Color
+    ctx.fillStyle = barColor(norm, panelIdx, i === hIdx);
+    ctx.fillRect(x, y, bww, barH);
+
+    // Peak line
+    const pdb = Math.max(DB_MIN, Math.min(DB_MAX, peaks[i]));
+    const pnorm = (pdb - DB_MIN) / (DB_MAX - DB_MIN);
+    const py = P.t + ph * (1 - pnorm);
+    ctx.fillStyle = i === hIdx ? '#fff' : 'rgba(255,255,255,0.6)';
+    ctx.fillRect(x, py - dpr, bww, 2 * dpr);
+
+    // Hover highlight
+    if (i === hIdx) {
+      ctx.strokeStyle = '#ffffff55'; ctx.lineWidth = 1;
+      ctx.strokeRect(x - 1, P.t, bww + 2, ph);
+    }
+  }
+
+  // X-axis labels
+  ctx.fillStyle = '#484f58'; ctx.font = `${8*dpr}px Consolas,monospace`;
+  ctx.textAlign = 'center'; ctx.textBaseline = 'top';
+  if (panelIdx === 3) {
+    // Octave: label every bar
+    for (let i = 0; i < n; i++) {
+      ctx.fillText(OCTAVE_LBL[i], P.l + (i + 0.5) * bw, P.t + ph + 4*dpr);
+    }
+  } else {
+    // Spectrum / Mel: label a subset
+    const step = panelIdx === 1 ? 8 : 5;
+    for (let i = 0; i < n; i += step) {
+      let lbl;
+      if (panelIdx === 1 && bandInfo) {
+        const hz = bandInfo[i].hz;
+        lbl = hz >= 1000 ? (hz / 1000).toFixed(1) + 'k' : Math.round(hz) + '';
+      } else {
+        lbl = String(i);
+      }
+      ctx.fillText(lbl, P.l + (i + 0.5) * bw, P.t + ph + 4*dpr);
+    }
+  }
+
+  // X-axis unit
+  ctx.fillStyle = '#484f58'; ctx.font = `${8*dpr}px sans-serif`;
+  ctx.textAlign = 'right'; ctx.textBaseline = 'top';
+  const unit = panelIdx === 1 ? 'Hz' : panelIdx === 2 ? 'Mel Band' : 'Hz';
+  ctx.fillText(unit, P.l + pw, P.t + ph + 14*dpr);
+
+  // Legend
+  const legendColors = ['', '#3fb950', '#bc8cff', '#f0883e'];
+  const legendLabels = ['', 'Log Frequency', 'Mel Filter Bank', '1/1 Octave'];
+  drawLegendItem(ctx, w - 130*dpr, P.t + 2*dpr, legendColors[panelIdx], legendLabels[panelIdx]);
+
+  // Hover value tooltip
+  if (hIdx >= 0 && hIdx < n) {
+    const db = data[hIdx];
+    const x = P.l + (hIdx + 0.5) * bw;
+    const norm = Math.max(0, (db - DB_MIN) / (DB_MAX - DB_MIN));
+    const y = P.t + ph * (1 - norm);
+    const txt = `${db > -100 ? db.toFixed(1) : '—'} dB`;
+    ctx.font = `bold ${10*dpr}px Consolas,monospace`;
+    const tw = ctx.measureText(txt).width;
+    const tx = Math.min(x - tw / 2, w - P.r - tw - 4*dpr);
+    const ty = Math.max(y - 18*dpr, P.t + 2*dpr);
+    ctx.fillStyle = 'rgba(0,0,0,0.8)'; ctx.fillRect(tx - 4*dpr, ty - 2*dpr, tw + 8*dpr, 14*dpr);
+    ctx.fillStyle = '#fff'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+    ctx.fillText(txt, tx, ty);
+  }
+}
+
+function barColor(norm, panel, hover) {
+  const bright = hover ? 20 : 0;
+  if (panel === 1) { // green → yellow → red
+    const h = (1 - norm) * 120;
+    return `hsl(${h},80%,${40 + norm * 15 + bright}%)`;
+  }
+  if (panel === 2) { // blue → purple
+    return `hsl(${260 - norm * 30},65%,${35 + norm * 20 + bright}%)`;
+  }
+  // Octave: orange → amber
+  return `hsl(${25 + norm * 15},85%,${35 + norm * 20 + bright}%)`;
+}
+
+function drawLegendItem(ctx, x, y, color, label) {
+  const fs = 9 * dpr;
+  ctx.font = `${fs}px sans-serif`;
+  const tw = ctx.measureText(label).width;
+  ctx.fillStyle = 'rgba(13,17,23,0.8)';
+  ctx.fillRect(x - 4*dpr, y - 2*dpr, 18*dpr + tw + 8*dpr, 14*dpr);
+  ctx.fillStyle = color;
+  ctx.fillRect(x, y + 2*dpr, 12*dpr, 8*dpr);
+  ctx.fillStyle = '#8b949e'; ctx.textAlign = 'left'; ctx.textBaseline = 'top';
+  ctx.fillText(label, x + 16*dpr, y);
+}
+
+/* ================================================================
+   INFO BAR
+   ================================================================ */
+function updateInfoBar() {
+  if (!audioBuffer) { infoEl.innerHTML = '<span>오디오 파일을 로드하세요</span>'; return; }
+
+  const t = now();
+  let html = `<span>Time: <b class="hl">${fmtTime(t)}</b></span>`;
+  html += `<span>│</span>`;
+  html += `<span style="color:#58a6ff">LEQ: <b>${curLeq > -100 ? curLeq.toFixed(1) : '—'}</b> dBFS</span>`;
+
+  if (hoverPanel === 1 && specBands) {
+    const i = Math.floor(hoverNX * NUM_BANDS);
+    if (i >= 0 && i < NUM_BANDS) {
+      const hz = specBands[i].hz;
+      const hzStr = hz >= 1000 ? (hz/1000).toFixed(1)+'kHz' : Math.round(hz)+'Hz';
+      html += `<span>│</span><span style="color:#3fb950">Band ${hzStr}: <b>${curBands[i]>-100?curBands[i].toFixed(1):'—'}</b> dB</span>`;
+    }
+  } else if (hoverPanel === 2) {
+    const i = Math.floor(hoverNX * NUM_MEL);
+    if (i >= 0 && i < NUM_MEL)
+      html += `<span>│</span><span style="color:#bc8cff">Mel ${i}: <b>${curMel[i]>-100?curMel[i].toFixed(1):'—'}</b> dB</span>`;
+  } else if (hoverPanel === 3) {
+    const i = Math.floor(hoverNX * OCTAVE_FC.length);
+    if (i >= 0 && i < OCTAVE_FC.length)
+      html += `<span>│</span><span style="color:#f0883e">${OCTAVE_LBL[i]}Hz: <b>${curOctave[i]>-100?curOctave[i].toFixed(1):'—'}</b> dB</span>`;
+  } else if (hoverPanel === 0) {
+    const hoverT = hoverNX * audioBuffer.duration;
+    html += `<span>│</span><span style="color:#8b949e">Hover: ${fmtTime(hoverT)}</span>`;
+  }
+
+  infoEl.innerHTML = html;
+}
+
+/* ================================================================
+   EVENTS
+   ================================================================ */
+// File
+fileInput.addEventListener('change', e => { if (e.target.files[0]) loadFile(e.target.files[0]); });
+document.addEventListener('dragover', e => e.preventDefault());
+document.addEventListener('drop', e => { e.preventDefault(); if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]); });
+
+// Buttons
+btnPlay.addEventListener('click', () => { isPlaying ? doPause() : doPlay(); });
+btnStop.addEventListener('click', doStop);
+volSlider.addEventListener('input', () => { if (gainNode) gainNode.gain.value = +volSlider.value; });
+
+// Seekbar
+seekbar.addEventListener('input', () => {
+  seeking = true;
+  if (audioBuffer) {
+    const t = +seekbar.value * audioBuffer.duration;
+    seekTo(t);
+  }
+});
+seekbar.addEventListener('change', () => { seeking = false; });
+
+// Panel hover
+function getPanel(e) {
+  const col = e.clientX < innerWidth / 2 ? 0 : 1;
+  const toolH = 52, infoH = 28;
+  const panelH = innerHeight - toolH - infoH;
+  const row = (e.clientY - toolH) < panelH / 2 ? 0 : 1;
+  if (e.clientY < toolH || e.clientY > innerHeight - infoH) return -1;
+  return row * 2 + col;
+}
+addEventListener('mousemove', e => {
+  hoverPanel = getPanel(e);
+  if (hoverPanel >= 0) {
+    const r = canvases[hoverPanel].getBoundingClientRect();
+    // Normalized within the plot area (excluding padding)
+    const P = hoverPanel === 0
+      ? { l: 10, r: 10, t: 28, b: 22 }
+      : { l: 44, r: 10, t: 30, b: 28 };
+    hoverNX = Math.max(0, Math.min(1, (e.clientX - r.left - P.l) / (r.width - P.l - P.r)));
+    hoverNY = Math.max(0, Math.min(1, (e.clientY - r.top - P.t) / (r.height - P.t - P.b)));
+  }
+  if (!isPlaying) { drawAll(); updateInfoBar(); }
+});
+
+// Click waveform to seek
+canvases[0].addEventListener('click', e => {
+  if (!audioBuffer) return;
+  const r = canvases[0].getBoundingClientRect();
+  const nx = Math.max(0, Math.min(1, (e.clientX - r.left - 10) / (r.width - 20)));
+  seekTo(nx * audioBuffer.duration);
+});
+
+// Keyboard
+addEventListener('keydown', e => {
+  if (e.code === 'Space' && audioBuffer) { e.preventDefault(); isPlaying ? doPause() : doPlay(); }
+});
+
+/* ================================================================
+   INIT
+   ================================================================ */
+resize();
+drawAll();
+updateInfoBar();
+</script>
+</body>
+</html>
